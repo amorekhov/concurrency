@@ -14,13 +14,14 @@ public class AuctionPessimistic implements Auction {
         if (bid.getPrice() <= latestBid.getPrice()) {
         return false;
         }
+        Bid lastValueBid;
         synchronized (lock) {
             if (bid.getPrice() <= latestBid.getPrice()) {
                 return false;
         }
-            latestBid = bid;
+          lastValueBid = latestBid = bid;
         }
-        notifier.sendOutdatedMessage(latestBid);
+        notifier.sendOutdatedMessage(lastValueBid);
         return true;
     }
 
