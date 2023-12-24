@@ -1,8 +1,9 @@
 package course.concurrency.exams.refactoring;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
 
 
 public class MountTableRefresherService {
@@ -15,125 +16,98 @@ public class MountTableRefresherService {
      * again. Router admin address(host:port) is used as key to cache RouterClient
      * objects.
      */
-    private Others.LoadingCache<String, Others.RouterClient> routerClientsCache;
+    private Others.LoadingCache routerClientsCache;
 
     /**
      * Removes expired RouterClient from routerClientsCache.
      */
-    private ScheduledExecutorService clientCacheCleanerScheduler;
 
-    public void serviceInit()  {
-        long routerClientMaxLiveTime = 15L;
-        this.cacheUpdateTimeout = 10L;
-        routerClientsCache = new Others.LoadingCache<String, Others.RouterClient>();
-        routerStore.getCachedRecords().stream().map(Others.RouterState::getAdminAddress)
-                .forEach(addr -> routerClientsCache.add(addr, new Others.RouterClient()));
+    private ExecutorService refreshersExecutor;
 
-        initClientCacheCleaner(routerClientMaxLiveTime);
-    }
-
-    public void serviceStop() {
-        clientCacheCleanerScheduler.shutdown();
-        // remove and close all admin clients
-        routerClientsCache.cleanUp();
-    }
-
-    private void initClientCacheCleaner(long routerClientMaxLiveTime) {
-        ThreadFactory tf = new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-                Thread t = new Thread();
-                t.setName("MountTableRefresh_ClientsCacheCleaner");
-                t.setDaemon(true);
-                return t;
-            }
-        };
-
-        clientCacheCleanerScheduler =
-                Executors.newSingleThreadScheduledExecutor(tf);
-        /*
-         * When cleanUp() method is called, expired RouterClient will be removed and
-         * closed.
-         */
-        clientCacheCleanerScheduler.scheduleWithFixedDelay(
-                () -> routerClientsCache.cleanUp(), routerClientMaxLiveTime,
-                routerClientMaxLiveTime, TimeUnit.MILLISECONDS);
+    protected void setRefreshersExecutor(ExecutorService refreshersExecutor) {
+        this.refreshersExecutor = refreshersExecutor;
     }
 
     /**
      * Refresh mount table cache of this router as well as all other routers.
      */
     public void refresh()  {
-
-        List<Others.RouterState> cachedRecords = routerStore.getCachedRecords();
-        List<MountTableRefresherThread> refreshThreads = new ArrayList<>();
-        for (Others.RouterState routerState : cachedRecords) {
-            String adminAddress = routerState.getAdminAddress();
-            if (adminAddress == null || adminAddress.length() == 0) {
-                // this router has not enabled router admin.
-                continue;
-            }
-            if (isLocalAdmin(adminAddress)) {
-                /*
-                 * Local router's cache update does not require RPC call, so no need for
-                 * RouterClient
-                 */
-                refreshThreads.add(getLocalRefresher(adminAddress));
-            } else {
-                refreshThreads.add(new MountTableRefresherThread(
-                            new Others.MountTableManager(adminAddress), adminAddress));
-            }
-        }
-        if (!refreshThreads.isEmpty()) {
-            invokeRefresh(refreshThreads);
+        List<MountTableRefresherRunnable> refreshers = routerStore.getCachedRecords()
+                .stream()
+                .map(this::createMountTableRefresherRunnable)
+                .filter(Objects::nonNull)
+                .toList();
+        if (!refreshers.isEmpty()) {
+            invokeRefresh(refreshers);
         }
     }
 
-    protected MountTableRefresherThread getLocalRefresher(String adminAddress) {
-        return new MountTableRefresherThread(new Others.MountTableManager("local"), adminAddress);
+    protected MountTableRefresherRunnable createMountTableRefresherRunnable(Others.RouterState routerState) {
+        String adminAddress = routerState.getAdminAddress();
+        if (adminAddress == null || adminAddress.isBlank()) {
+            return null;
+        } else {
+            Others.MountTableManager mountTableManager = getMountTableManager(adminAddress);
+            return new MountTableRefresherRunnable(mountTableManager, adminAddress);
+        }
+    }
+
+    protected Others.MountTableManager getMountTableManager(String adminAdress) {
+        if (adminAdress.contains("local")) {
+            /*
+             * Local router's cache update does not require RPC call, so no need for
+             * RouterClient
+             */
+            return new Others.MountTableManager("local");
+        } else {
+            return new Others.MountTableManager(adminAdress);
+        }
     }
 
     private void removeFromCache(String adminAddress) {
         routerClientsCache.invalidate(adminAddress);
     }
 
-    private void invokeRefresh(List<MountTableRefresherThread> refreshThreads) {
-        CountDownLatch countDownLatch = new CountDownLatch(refreshThreads.size());
-        // start all the threads
-        for (MountTableRefresherThread refThread : refreshThreads) {
-            refThread.setCountDownLatch(countDownLatch);
-            refThread.start();
-        }
+    private void invokeRefresh(List<MountTableRefresherRunnable> refreshers) {
+        CompletableFuture[] futures = refreshers.stream()
+                .map(this::createCompletableFuture)
+                .toArray(CompletableFuture[]::new);
+
         try {
             /*
-             * Wait for all the thread to complete, await method returns false if
-             * refresh is not finished within specified time
+             * Wait for all the thread to complete, await method returns false if refresh is
+             * not finished within specified time
              */
-            boolean allReqCompleted =
-                    countDownLatch.await(cacheUpdateTimeout, TimeUnit.MILLISECONDS);
-            if (!allReqCompleted) {
-                log("Not all router admins updated their cache");
-            }
-        } catch (InterruptedException e) {
+            CompletableFuture.allOf(futures).get(cacheUpdateTimeout, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException | InterruptedException | ExecutionException e) {
             log("Mount table cache refresher was interrupted.");
         }
-        logResult(refreshThreads);
+
+        if (!refreshers.stream().allMatch(MountTableRefresherRunnable::isSuccess)) {
+            log("Not all router admins updated their cache");
+        }
+
+        logResult(refreshers);
     }
 
-    private boolean isLocalAdmin(String adminAddress) {
-        return adminAddress.contains("local");
+    private CompletableFuture<?> createCompletableFuture(MountTableRefresherRunnable refresher) {
+        Supplier<Boolean> asyncSupplier = () -> {
+            refresher.run();
+            return refresher.isSuccess();
+        };
+        return CompletableFuture.supplyAsync(asyncSupplier, refreshersExecutor).exceptionally(ex -> false);
     }
 
-    private void logResult(List<MountTableRefresherThread> refreshThreads) {
+    private void logResult(List<MountTableRefresherRunnable> refreshers) {
         int successCount = 0;
         int failureCount = 0;
-        for (MountTableRefresherThread mountTableRefreshThread : refreshThreads) {
-            if (mountTableRefreshThread.isSuccess()) {
+        for (MountTableRefresherRunnable mountTableRefresherRunnable : refreshers) {
+            if (mountTableRefresherRunnable.isSuccess()) {
                 successCount++;
             } else {
                 failureCount++;
                 // remove RouterClient from cache so that new client is created
-                removeFromCache(mountTableRefreshThread.getAdminAddress());
+                removeFromCache(mountTableRefresherRunnable.getAdminAddress());
             }
         }
         log(String.format(
